@@ -1,3 +1,97 @@
+use image::{DynamicImage, GenericImageView, ImageBuffer};
+
+pub struct Map<P: Projection> {
+    image: DynamicImage,
+    projection: P,
+}
+
+impl<P: Projection> Map<P> {
+    pub fn new(image: impl Into<DynamicImage>, projection: P) -> Self {
+        Map {
+            image: image.into(),
+            projection,
+        }
+    }
+
+    pub fn image(&self) -> &impl GenericImageView {
+        &self.image
+    }
+
+    pub fn to_image(self) -> DynamicImage {
+        self.image
+    }
+
+    pub fn projection(&self) -> &P {
+        &self.projection
+    }
+
+    pub fn convert_to<Q: Projection>(self, projection: Q) -> Map<Q> {
+        let image_dimensions = self.image.dimensions();
+        let source_projection_dimensions = self.projection.dimensions();
+        let target_projection_dimensions = projection.dimensions();
+        let scale = (target_projection_dimensions.width.to
+            - target_projection_dimensions.width.from)
+            / (target_projection_dimensions.height.to - target_projection_dimensions.height.from);
+        let new_image_dimensions = (
+            (scale * image_dimensions.1 as f64) as u32,
+            image_dimensions.1,
+        );
+        let (source_coordinate_increment_x, source_coordinate_increment_y) = (
+            (source_projection_dimensions.width.to - source_projection_dimensions.width.from)
+                / image_dimensions.0 as f64,
+            (source_projection_dimensions.height.to - source_projection_dimensions.height.from)
+                / image_dimensions.1 as f64,
+        );
+        let (target_coordinate_increment_x, target_coordinate_increment_y) = (
+            (target_projection_dimensions.width.to - target_projection_dimensions.width.from)
+                / new_image_dimensions.0 as f64,
+            (target_projection_dimensions.height.to - target_projection_dimensions.height.from)
+                / new_image_dimensions.1 as f64,
+        );
+        let mut new_image = ImageBuffer::new(new_image_dimensions.0, new_image_dimensions.1);
+        for target_pixel_x in (0..new_image_dimensions.0).map(|i| i as f64) {
+            for target_pixel_y in (0..new_image_dimensions.1).map(|i| i as f64) {
+                let target_upper_left = (
+                    target_projection_dimensions.width.from
+                        + target_coordinate_increment_x * target_pixel_x,
+                    target_projection_dimensions.height.from
+                        + target_coordinate_increment_y * target_pixel_y,
+                );
+                let target_lower_right = (
+                    target_upper_left.0 + target_coordinate_increment_x,
+                    target_upper_left.1 + target_coordinate_increment_y,
+                );
+                let target_upper_left =
+                    ProjectedPoint::from_normalized(target_upper_left, &projection);
+                let target_lower_right =
+                    ProjectedPoint::from_normalized(target_lower_right, &projection);
+                let source_upper_left = target_upper_left.project(&self.projection);
+                let source_lower_right = target_lower_right.project(&self.projection);
+                let mut source_pixel_x = ((source_upper_left.x
+                    - source_projection_dimensions.width.from)
+                    / source_coordinate_increment_x)
+                    .floor() as u32;
+                if source_pixel_x == image_dimensions.0 {
+                    source_pixel_x = 0;
+                }
+                let source_pixel_y = ((source_upper_left.y
+                    - source_projection_dimensions.height.from)
+                    / source_coordinate_increment_y)
+                    .floor() as u32;
+                new_image.put_pixel(
+                    target_pixel_x as u32,
+                    target_pixel_y as u32,
+                    self.image.get_pixel(source_pixel_x, source_pixel_y),
+                );
+            }
+        }
+        Map {
+            image: new_image.into(),
+            projection,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Point {
     /// Longitude, ranges from -180 to 180, negative values are to the right of the zero meridian when the globe is viewed with the north pole at the top
@@ -17,47 +111,80 @@ pub trait Projectable<P: Projection> {
     fn project<'p>(&self, projection: &'p P) -> ProjectedPoint<'p, P>;
 }
 
+#[derive(Debug)]
+pub struct Interval<T> {
+    pub from: T,
+    pub to: T,
+}
+
+#[derive(Debug)]
+pub struct Dimensions {
+    width: Interval<f64>,
+    height: Interval<f64>,
+}
+
 pub trait Projection {
+    fn dimensions(&self) -> Dimensions;
     fn project(&self, point: &Point) -> (f64, f64);
     fn invert(&self, projected_point: (f64, f64)) -> Point;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Equirectangular {
-    central_long: f64,
-    true_scale_lat: f64,
-}
-
-pub struct EquirectangularBuilder {
-    _inner: Equirectangular,
-}
-
-impl EquirectangularBuilder {
-    pub fn central_long(mut self, long: f64) -> Self {
-        self._inner.central_long = long;
-        self
-    }
-
-    pub fn true_scale_lat(mut self, lat: f64) -> Self {
-        self._inner.true_scale_lat = lat;
-        self
-    }
-
-    pub fn build(self) -> Equirectangular {
-        self._inner
+    fn convert_point<Q: Projection>(
+        &self,
+        projected_point: (f64, f64),
+        target_projection: &Q,
+    ) -> (f64, f64) {
+        target_projection.project(&self.invert(projected_point))
     }
 }
 
 /// The projected points from this projection form a rectangle whose y-axis always runs from -1 to 1
-/// and whose x-axis runs from -s to s, where s is 2*cos(true_scale_lat), twice the cosine of the latitude at
+/// and whose x-axis runs from -s to s, where s is 2 * cos(true_scale_lat), twice the cosine of the latitude at
 /// which the projection is true.
+#[derive(Clone, Copy, Debug)]
+pub struct Equirectangular {
+    central_long: f64,
+    true_scale_lat: f64,
+    width: f64,
+}
+
+impl Equirectangular {
+    pub fn central_long(&self) -> f64 {
+        self.central_long
+    }
+    pub fn true_scale_lat(&self) -> f64 {
+        self.true_scale_lat
+    }
+}
+
+pub struct EquirectangularBuilder {
+    central_long: f64,
+    true_scale_lat: f64,
+}
+
+impl EquirectangularBuilder {
+    pub fn central_long(mut self, long: f64) -> Self {
+        self.central_long = long;
+        self
+    }
+
+    pub fn true_scale_lat(mut self, lat: f64) -> Self {
+        self.true_scale_lat = lat;
+        self
+    }
+
+    pub fn build(self) -> Equirectangular {
+        Equirectangular {
+            central_long: self.central_long,
+            true_scale_lat: self.true_scale_lat,
+            width: self.true_scale_lat.to_radians().cos(),
+        }
+    }
+}
+
 impl Equirectangular {
     pub fn new() -> EquirectangularBuilder {
         EquirectangularBuilder {
-            _inner: Equirectangular {
-                central_long: 0.,
-                true_scale_lat: 0.,
-            },
+            central_long: 0.,
+            true_scale_lat: 0.,
         }
     }
 }
@@ -75,15 +202,13 @@ impl Projection for Equirectangular {
                 } else {
                     x
                 }
-            } * 2.
-                * self.true_scale_lat.to_radians().cos(),
+            } * (2. * self.width),
             y,
         )
     }
 
     fn invert(&self, projected_point: (f64, f64)) -> Point {
-        let long = 180. * projected_point.0 / (2. * self.true_scale_lat.to_radians().cos())
-            + self.central_long;
+        let long = 180. * projected_point.0 / (2. * self.width) + self.central_long;
         let lat = 90. * projected_point.1;
         Point {
             long: if long > 180. {
@@ -96,6 +221,16 @@ impl Projection for Equirectangular {
                 }
             },
             lat,
+        }
+    }
+
+    fn dimensions(&self) -> Dimensions {
+        Dimensions {
+            width: Interval {
+                from: -2. * self.width,
+                to: 2. * self.width,
+            },
+            height: Interval { from: -1., to: 1. },
         }
     }
 }
@@ -132,6 +267,13 @@ impl<'p, P: Projection> ProjectedPoint<'p, P> {
     }
 
     pub fn from_normalized((x, y): (f64, f64), projection: &'p P) -> Self {
+        ProjectedPoint { x, y, projection }
+    }
+}
+
+impl<'p, P: Projection, Q: Projection> Projectable<Q> for ProjectedPoint<'p, P> {
+    fn project<'q>(&self, projection: &'q Q) -> ProjectedPoint<'q, Q> {
+        let (x, y) = self.projection.convert_point((self.x, self.y), projection);
         ProjectedPoint { x, y, projection }
     }
 }
@@ -344,10 +486,10 @@ mod tests {
                     ((0., 90.), (0., 1.)),
                     ((30., 60.), (2. / 6., 2. / 3.)),
                 ],
-                Equirectangular {
-                    central_long: 0.,
-                    true_scale_lat: 0.,
-                },
+                Equirectangular::new()
+                    .central_long(0.)
+                    .true_scale_lat(0.)
+                    .build(),
             );
         }
 
@@ -360,10 +502,10 @@ mod tests {
                     ((90., 0.), (-1., 0.)),
                     ((-90., 0.), (1., 0.)),
                 ],
-                Equirectangular {
-                    central_long: 180.,
-                    true_scale_lat: 0.,
-                },
+                Equirectangular::new()
+                    .central_long(180.)
+                    .true_scale_lat(0.)
+                    .build(),
             );
         }
 
@@ -375,21 +517,51 @@ mod tests {
                     ((90., 0.), (2., 0.)),
                     ((135., 0.), (-1.5, 0.)),
                 ],
-                Equirectangular {
-                    central_long: -90.,
-                    true_scale_lat: 0.,
-                },
+                Equirectangular::new()
+                    .central_long(-90.)
+                    .true_scale_lat(0.)
+                    .build(),
             );
         }
 
         #[test]
         fn true_scale_not_equator() {
             assert_projections(
-                vec![((0., 0.), (0., 0.)), ((180., 0.), (1., 0.))],
-                Equirectangular {
-                    central_long: 0.,
-                    true_scale_lat: 60.,
-                },
+                vec![
+                    ((0., 0.), (0., 0.)),
+                    ((180., 0.), (1., 0.)),
+                    ((-90., 0.), (-1. / 2., 0.)),
+                ],
+                Equirectangular::new()
+                    .central_long(0.)
+                    .true_scale_lat(60.)
+                    .build(),
+            );
+        }
+
+        #[test]
+        fn different_central_longs() {
+            let default_projection = Equirectangular::new().build();
+            let shifted_projection = Equirectangular::new().central_long(90.).build();
+            let projected_point = ProjectedPoint::from_normalized((0., 0.), &default_projection);
+            let converted_projected_point = projected_point.project(&shifted_projection);
+            assert_float_eq!(
+                converted_projected_point,
+                ProjectedPoint::from_normalized((-1., 0.), &shifted_projection),
+                r2nd <= f64::EPSILON
+            );
+        }
+
+        #[test]
+        fn different_true_scale_lats() {
+            let default_projection = Equirectangular::new().build();
+            let shifted_projection = Equirectangular::new().true_scale_lat(60.).build();
+            let projected_point = ProjectedPoint::from_normalized((1., 0.), &default_projection);
+            let converted_projected_point = projected_point.project(&shifted_projection);
+            assert_float_eq!(
+                converted_projected_point,
+                ProjectedPoint::from_normalized((0.5, 0.), &shifted_projection),
+                r2nd <= f64::EPSILON
             );
         }
     }
