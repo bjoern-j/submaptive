@@ -65,24 +65,31 @@ impl<P: Projection> Map<P> {
                     ProjectedPoint::from_normalized(target_upper_left, &projection);
                 let target_lower_right =
                     ProjectedPoint::from_normalized(target_lower_right, &projection);
-                let source_upper_left = target_upper_left.project(&self.projection);
-                let source_lower_right = target_lower_right.project(&self.projection);
-                let mut source_pixel_x = ((source_upper_left.x
-                    - source_projection_dimensions.width.from)
-                    / source_coordinate_increment_x)
-                    .floor() as u32;
-                if source_pixel_x == image_dimensions.0 {
-                    source_pixel_x = 0;
+                if !target_upper_left.is_err() && !target_lower_right.is_err() {
+                    let target_upper_left = target_upper_left.unwrap();
+                    let target_lower_right = target_lower_right.unwrap();
+                    let source_upper_left = target_upper_left.project(&self.projection);
+                    let source_lower_right = target_lower_right.project(&self.projection);
+                    let mut source_pixel_x = ((source_upper_left.x
+                        - source_projection_dimensions.width.from)
+                        / source_coordinate_increment_x)
+                        .floor() as u32;
+                    if source_pixel_x == image_dimensions.0 {
+                        source_pixel_x = 0;
+                    }
+                    let mut source_pixel_y = ((source_upper_left.y
+                        - source_projection_dimensions.height.from)
+                        / source_coordinate_increment_y)
+                        .floor() as u32;
+                    if source_pixel_y == image_dimensions.1 {
+                        source_pixel_y = 0;
+                    }
+                    new_image.put_pixel(
+                        target_pixel_x as u32,
+                        target_pixel_y as u32,
+                        self.image.get_pixel(source_pixel_x, source_pixel_y),
+                    );
                 }
-                let source_pixel_y = ((source_upper_left.y
-                    - source_projection_dimensions.height.from)
-                    / source_coordinate_increment_y)
-                    .floor() as u32;
-                new_image.put_pixel(
-                    target_pixel_x as u32,
-                    target_pixel_y as u32,
-                    self.image.get_pixel(source_pixel_x, source_pixel_y),
-                );
             }
         }
         Map {
@@ -98,6 +105,15 @@ pub struct Point {
     long: f64,
     /// Latitude, ranges from -90 (south pole) to 90 (north pole)
     lat: f64,
+}
+
+impl Point {
+    pub fn long(&self) -> f64 {
+        self.long
+    }
+    pub fn lat(&self) -> f64 {
+        self.lat
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,10 +133,22 @@ pub struct Interval<T> {
     pub to: T,
 }
 
+impl<T: PartialOrd> Interval<T> {
+    pub fn is_within(&self, value: &T) -> bool {
+        self.from <= *value && *value <= self.to
+    }
+}
+
 #[derive(Debug)]
 pub struct Dimensions {
     width: Interval<f64>,
     height: Interval<f64>,
+}
+
+impl Dimensions {
+    pub fn is_within(&self, point: (f64, f64)) -> bool {
+        self.width.is_within(&point.0) && self.height.is_within(&point.1)
+    }
 }
 
 pub trait Projection {
@@ -133,6 +161,139 @@ pub trait Projection {
         target_projection: &Q,
     ) -> (f64, f64) {
         target_projection.project(&self.invert(projected_point))
+    }
+    fn projected_point_within_bounds(&self, point: (f64, f64)) -> bool;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AzimuthalEquidistant {
+    center: Point,
+    central_long: f64,
+}
+
+impl AzimuthalEquidistant {
+    pub fn new() -> AzimuthalEquidistantBuilder {
+        AzimuthalEquidistantBuilder {
+            center: Point { lat: 90., long: 0. },
+            central_long: 0.,
+        }
+    }
+}
+
+impl AzimuthalEquidistant {
+    pub fn center(&self) -> Point {
+        self.center
+    }
+    pub fn central_long(&self) -> f64 {
+        self.central_long
+    }
+}
+
+impl Projection for AzimuthalEquidistant {
+    fn dimensions(&self) -> Dimensions {
+        Dimensions {
+            width: Interval { from: -1., to: 1. },
+            height: Interval { from: -1., to: 1. },
+        }
+    }
+
+    fn project(&self, point: &Point) -> (f64, f64) {
+        // https://mathworld.wolfram.com/AzimuthalEquidistantProjection.html
+        let angular_distance = (point.lat.to_radians().sin() * self.center.lat.to_radians().sin()
+            + point.lat.to_radians().cos()
+                * self.center.lat.to_radians().cos()
+                * (point.long - self.center.long).to_radians().cos())
+        .acos();
+        let k = if angular_distance != 0. {
+            angular_distance / angular_distance.sin()
+        } else {
+            0.
+        };
+        let x =
+            k * point.lat.to_radians().cos() * (point.long - self.center.long).to_radians().sin()
+                / std::f64::consts::PI;
+        let y = k
+            * (point.lat.to_radians().sin() * self.center.lat.to_radians().cos()
+                - point.lat.to_radians().cos()
+                    * self.center.lat.to_radians().sin()
+                    * (point.long - self.center.long).to_radians().cos())
+            / std::f64::consts::PI;
+        if self.central_long != 0. {
+            (
+                x * self.central_long.to_radians().cos() + y * self.central_long.to_radians().sin(),
+                -x * self.central_long.to_radians().sin()
+                    + y * self.central_long.to_radians().cos(),
+            )
+        } else {
+            (x, y)
+        }
+    }
+
+    fn invert(&self, projected_point: (f64, f64)) -> Point {
+        let mut projected_point = (
+            projected_point.0 * std::f64::consts::PI,
+            projected_point.1 * std::f64::consts::PI,
+        );
+        if self.central_long != 0. {
+            projected_point = (
+                projected_point.0 * self.central_long.to_radians().cos()
+                    - projected_point.1 * self.central_long.to_radians().sin(),
+                projected_point.0 * self.central_long.to_radians().sin()
+                    + projected_point.1 * self.central_long.to_radians().cos(),
+            )
+        }
+        let angular_distance =
+            (projected_point.0 * projected_point.0 + projected_point.1 * projected_point.1).sqrt();
+        if angular_distance == 0. {
+            return self.center;
+        }
+        let lat = (angular_distance.cos() * self.center.lat.to_radians().sin()
+            + projected_point.1 * angular_distance.sin() * self.center.lat.to_radians().cos()
+                / angular_distance)
+            .asin()
+            .to_degrees();
+        let long = self.center.long
+            + (projected_point.0 * angular_distance.sin())
+                .atan2(
+                    angular_distance * self.center.lat.to_radians().cos() * angular_distance.cos()
+                        - projected_point.1
+                            * self.center.lat.to_radians().sin()
+                            * angular_distance.sin(),
+                )
+                .to_degrees();
+        Point { lat, long }
+    }
+
+    fn projected_point_within_bounds(&self, point: (f64, f64)) -> bool {
+        if self.dimensions().is_within(point) {
+            (point.0 * point.0 + point.1 * point.1) <= 1.
+        } else {
+            false
+        }
+    }
+}
+
+pub struct AzimuthalEquidistantBuilder {
+    center: Point,
+    central_long: f64,
+}
+
+impl AzimuthalEquidistantBuilder {
+    pub fn center(mut self, center: Point) -> Self {
+        self.center = center;
+        self
+    }
+
+    pub fn central_long(mut self, central_long: f64) -> Self {
+        self.central_long = central_long;
+        self
+    }
+
+    pub fn build(self) -> AzimuthalEquidistant {
+        AzimuthalEquidistant {
+            center: self.center,
+            central_long: self.central_long,
+        }
     }
 }
 
@@ -233,6 +394,10 @@ impl Projection for Equirectangular {
             height: Interval { from: -1., to: 1. },
         }
     }
+
+    fn projected_point_within_bounds(&self, point: (f64, f64)) -> bool {
+        self.dimensions().is_within(point)
+    }
 }
 
 impl Point {
@@ -252,11 +417,17 @@ impl<P: Projection> Projectable<P> for Point {
     }
 }
 
-impl From<(f64, f64)> for Point {
-    fn from(value: (f64, f64)) -> Self {
-        Point {
-            long: value.0,
-            lat: value.1,
+impl TryFrom<(f64, f64)> for Point {
+    type Error = ();
+
+    fn try_from(value: (f64, f64)) -> Result<Self, Self::Error> {
+        if -180. <= value.0 && value.0 <= 180. && -90. <= value.1 && value.1 <= 90. {
+            Ok(Point {
+                long: value.0,
+                lat: value.1,
+            })
+        } else {
+            Err(())
         }
     }
 }
@@ -265,9 +436,13 @@ impl<'p, P: Projection> ProjectedPoint<'p, P> {
     pub fn point(&self) -> Point {
         self.projection.invert((self.x, self.y))
     }
-
-    pub fn from_normalized((x, y): (f64, f64), projection: &'p P) -> Self {
-        ProjectedPoint { x, y, projection }
+    /// The error occurs when the point (x, y) is outside of the range the projection would normally produce
+    pub fn from_normalized((x, y): (f64, f64), projection: &'p P) -> Result<Self, ()> {
+        if projection.projected_point_within_bounds((x, y)) {
+            Ok(ProjectedPoint { x, y, projection })
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -461,17 +636,19 @@ mod tests {
         }
     }
 
-    fn assert_projections<P: Projection + std::fmt::Debug>(
-        input: Vec<(impl Into<Point>, (f64, f64))>,
+    fn assert_projections<T: TryInto<Point> + std::fmt::Debug, P: Projection + std::fmt::Debug>(
+        input: Vec<(T, (f64, f64))>,
         projection: P,
-    ) {
+    ) where
+        <T as TryInto<Point>>::Error: std::fmt::Debug,
+    {
         for (point, expected_projection) in input {
-            let point = point.into();
+            let point = point.try_into().unwrap();
             let actual_projection = point.project(&projection);
             let expected_projection =
-                ProjectedPoint::from_normalized(expected_projection, &projection);
-            assert_float_eq!(actual_projection, expected_projection, r2nd <= f64::EPSILON);
-            assert_float_eq!(point, expected_projection.point(), r2nd <= f64::EPSILON);
+                ProjectedPoint::from_normalized(expected_projection, &projection).unwrap();
+            assert_float_eq!(actual_projection, expected_projection, abs <= 0.001);
+            assert_float_eq!(point, expected_projection.point(), abs <= 0.001);
         }
     }
 
@@ -543,11 +720,12 @@ mod tests {
         fn different_central_longs() {
             let default_projection = Equirectangular::new().build();
             let shifted_projection = Equirectangular::new().central_long(90.).build();
-            let projected_point = ProjectedPoint::from_normalized((0., 0.), &default_projection);
+            let projected_point =
+                ProjectedPoint::from_normalized((0., 0.), &default_projection).unwrap();
             let converted_projected_point = projected_point.project(&shifted_projection);
             assert_float_eq!(
                 converted_projected_point,
-                ProjectedPoint::from_normalized((-1., 0.), &shifted_projection),
+                ProjectedPoint::from_normalized((-1., 0.), &shifted_projection).unwrap(),
                 r2nd <= f64::EPSILON
             );
         }
@@ -556,12 +734,48 @@ mod tests {
         fn different_true_scale_lats() {
             let default_projection = Equirectangular::new().build();
             let shifted_projection = Equirectangular::new().true_scale_lat(60.).build();
-            let projected_point = ProjectedPoint::from_normalized((1., 0.), &default_projection);
+            let projected_point =
+                ProjectedPoint::from_normalized((1., 0.), &default_projection).unwrap();
             let converted_projected_point = projected_point.project(&shifted_projection);
             assert_float_eq!(
                 converted_projected_point,
-                ProjectedPoint::from_normalized((0.5, 0.), &shifted_projection),
+                ProjectedPoint::from_normalized((0.5, 0.), &shifted_projection).unwrap(),
                 r2nd <= f64::EPSILON
+            );
+        }
+    }
+
+    mod azimuthal_equidistant {
+        use super::*;
+
+        #[test]
+        fn north_pole() {
+            assert_projections(
+                vec![
+                    ((0., 90.), (0., 0.)),
+                    ((90., 0.), (0.5, 0.)),
+                    ((-90., 0.), (-0.5, 0.)),
+                    ((0., 0.), (0., -0.5)),
+                ],
+                AzimuthalEquidistant::new()
+                    .center((0., 90.).try_into().unwrap())
+                    .build(),
+            );
+        }
+
+        #[test]
+        fn north_pole_shifted() {
+            assert_projections(
+                vec![
+                    ((0., 90.), (0., 0.)),
+                    ((90., 0.), (0., -0.5)),
+                    ((-90., 0.), (0., 0.5)),
+                    ((0., 0.), (-0.5, 0.)),
+                ],
+                AzimuthalEquidistant::new()
+                    .center((0., 90.).try_into().unwrap())
+                    .central_long(90.)
+                    .build(),
             );
         }
     }
